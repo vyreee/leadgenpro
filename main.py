@@ -326,16 +326,38 @@ def main():
                 help="Use previously cached search results to reduce API costs"
             )
         
+        # Replace the Generate Leads button handler in main.py
         if st.button("Generate Leads"):
             if not location or ',' not in location:
                 st.error("Please enter location in City, State format")
                 return
             
+            # Verify the API key is valid
+            if not google_api_key or google_api_key.strip() == "":
+                st.error("Please enter a valid Google Places API Key in the sidebar")
+                return
+                
             try:
                 with st.spinner("Generating leads..."):
                     # Use custom term if provided, otherwise use default
                     search_term = custom_term if custom_term else business_categories[selected_category][selected_type]
                     
+                    # First verify the location can be geocoded
+                    try:
+                        # Clear existing geocode cache for this location if requested
+                        if st.checkbox("Clear location cache before searching", value=False):
+                            components['lead_generator'].clear_geocode_cache(location=location)
+                            st.info(f"Cleared cache for {location}")
+                        
+                        # Test geocoding first before proceeding
+                        with st.status("Verifying location...") as status:
+                            lat, lng = components['lead_generator'].geocode_location(location)
+                            status.update(label=f"Location verified: {lat}, {lng}", state="complete")
+                    except ValueError as e:
+                        st.error(f"Location error: {str(e)}")
+                        st.info("Try clearing the cache for this location or check your Google API key billing status")
+                        return
+                        
                     # Generate leads
                     if use_region_splitting or max_results > 60:
                         # Use split region search for more comprehensive results
@@ -408,10 +430,21 @@ def main():
                         )
                 else:
                     st.warning("No leads found. Try adjusting your search parameters.")
-                    
+                        
             except Exception as e:
                 st.error(f"Error generating leads: {str(e)}")
                 st.error(f"Error details:\n{traceback.format_exc()}")
+                
+                # If it's a Google API error, provide helpful suggestions
+                error_str = str(e).lower()
+                if "api" in error_str and ("key" in error_str or "billing" in error_str or "quota" in error_str):
+                    st.warning("""
+                    This appears to be a Google API issue. Please check:
+                    1. Your Google API key is correct
+                    2. Billing is enabled for your Google Cloud project
+                    3. You have the Places API enabled
+                    4. You haven't exceeded your quota
+                    """)
 
     with tab3:
         if components:
