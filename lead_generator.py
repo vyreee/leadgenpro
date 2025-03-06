@@ -118,31 +118,84 @@ class LeadGenerator:
         conn.close()
     
     def geocode_location(self, location: str) -> Tuple[float, float]:
-        """Geocode a location string to coordinates with caching"""
-        # Create a simple cache key for the location
-        cache_params = {"geocode": location}
-        cached_result = self._get_cached_search(cache_params)
-        
-        if cached_result:
-            st.info(f"Using cached geocode for {location}")
-            return cached_result[0], cached_result[1]
+        """Geocode a location string to coordinates with improved caching and error handling"""
+        try:
+            # Normalize location string to improve cache hits
+            normalized_location = location.strip().lower()
             
-        # Get location coordinates
-        geocode_url = f"https://maps.googleapis.com/maps/api/geocode/json?address={quote(location)}&key={self.api_key}"
-        geocode_response = requests.get(geocode_url)
-        geocode_data = geocode_response.json()
+            # Create a simple cache key for the location
+            cache_params = {"geocode": normalized_location}
+            cached_result = self._get_cached_search(cache_params)
+            
+            if cached_result:
+                st.info(f"Using cached geocode for {location}")
+                return cached_result[0], cached_result[1]
+                
+            # Get location coordinates
+            geocode_url = f"https://maps.googleapis.com/maps/api/geocode/json?address={quote(location)}&key={self.api_key}"
+            
+            # Add retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    geocode_response = requests.get(geocode_url, timeout=10)
+                    geocode_data = geocode_response.json()
+                    
+                    if geocode_data['status'] == 'OK':
+                        # Extract coordinates
+                        lat = geocode_data['results'][0]['geometry']['location']['lat']
+                        lng = geocode_data['results'][0]['geometry']['location']['lng']
+                        
+                        # Cache the result
+                        self._save_to_cache(cache_params, [lat, lng])
+                        
+                        return lat, lng
+                    elif geocode_data['status'] == 'ZERO_RESULTS':
+                        raise ValueError(f"Location not found: {location}")
+                    elif geocode_data['status'] in ['OVER_QUERY_LIMIT', 'REQUEST_DENIED']:
+                        if attempt < max_retries - 1:
+                            # Exponential backoff
+                            time.sleep(2 ** attempt)
+                            continue
+                        raise ValueError(f"API limit reached or request denied: {geocode_data['status']}")
+                    else:
+                        raise ValueError(f"Geocoding error: {geocode_data['status']}")
+                
+                except requests.exceptions.RequestException as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise ValueError(f"Network error: {str(e)}")
+            
+            raise ValueError(f"Failed to geocode after {max_retries} attempts")
+            
+        except Exception as e:
+            st.error(f"Geocoding error: {str(e)}")
+            # Log the error for debugging
+            print(f"Geocoding error for '{location}': {str(e)}")
+            raise ValueError(f"Could not geocode location: {location} - {str(e)}")
         
-        if geocode_data['status'] != 'OK':
-            raise ValueError(f"Could not geocode location: {location}")
+    def clear_geocode_cache(self, location=None):
+        """Clear geocode cache entries for a specific location or all locations"""
+        conn = sqlite3.connect(self.cache_db_path)
+        cursor = conn.cursor()
         
-        # Extract coordinates
-        lat = geocode_data['results'][0]['geometry']['location']['lat']
-        lng = geocode_data['results'][0]['geometry']['location']['lng']
-        
-        # Cache the result
-        self._save_to_cache(cache_params, [lat, lng])
-        
-        return lat, lng
+        if location:
+            # Normalize location string
+            normalized_location = location.strip().lower()
+            cache_params = {"geocode": normalized_location}
+            cache_key = self._cache_key(cache_params)
+            
+            cursor.execute("DELETE FROM search_cache WHERE cache_key = ?", (cache_key,))
+            deleted = cursor.rowcount
+            st.info(f"Cleared geocode cache for '{location}' ({deleted} entries)")
+        else:
+            cursor.execute("DELETE FROM search_cache WHERE search_params LIKE '%geocode%'")
+            deleted = cursor.rowcount
+            st.info(f"Cleared all geocode cache entries ({deleted} entries)")
+                
+        conn.commit()
+        conn.close()
     
     def get_place_details(self, place_id: str) -> Dict:
         """Get details for a place with caching"""
@@ -341,30 +394,130 @@ class LeadGenerator:
         conn.commit()
         conn.close()
     
-    def cache_stats(self) -> Dict:
-        """Return statistics about the cache"""
-        conn = sqlite3.connect(self.cache_db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT COUNT(*) FROM search_cache")
-        search_count = cursor.fetchone()[0]
-        
-        cursor.execute("SELECT COUNT(*) FROM place_details_cache")
-        details_count = cursor.fetchone()[0]
-        
-        # Get oldest and newest entries
-        cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM search_cache")
-        search_dates = cursor.fetchone()
-        
-        cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM place_details_cache")
-        details_dates = cursor.fetchone()
-        
-        conn.close()
-        
-        return {
-            "search_cache_entries": search_count,
-            "place_details_cache_entries": details_count,
-            "search_cache_date_range": search_dates,
-            "place_details_date_range": details_dates,
-            "estimated_api_calls_saved": search_count + details_count
-        }
+   # In the show_cache_stats function, update the cache management buttons:
+def show_cache_stats(components):
+    """Display cache statistics"""
+    st.subheader("Cache Statistics")
+    
+    col1, col2 = st.columns(2)
+    
+    # Lead Generator cache stats
+    try:
+        with col1:
+            generator_stats = components['lead_generator'].cache_stats()
+            st.write("**Lead Generator Cache:**")
+            st.write(f"- Search Cache Entries: {generator_stats['search_cache_entries']}")
+            st.write(f"- Place Details Cache Entries: {generator_stats['place_details_cache_entries']}")
+            
+            if generator_stats['search_cache_date_range'][0]:
+                st.write(f"- Oldest Entry: {generator_stats['search_cache_date_range'][0][:10]}")
+                st.write(f"- Newest Entry: {generator_stats['search_cache_date_range'][1][:10]}")
+                
+            st.write(f"- Estimated API Calls Saved: {generator_stats['estimated_api_calls_saved']}")
+    except Exception as e:
+        col1.error(f"Error retrieving generator cache stats: {str(e)}")
+    
+    # Lead Processor cache stats
+    try:
+        with col2:
+            processor_stats = components['processor'].cache_stats()
+            st.write("**Lead Processor Cache:**")
+            st.write(f"- Processed Lead Entries: {processor_stats['processed_lead_entries']}")
+            st.write(f"- Unique Websites: {processor_stats['unique_websites']}")
+            
+            if processor_stats['date_range'][0]:
+                st.write(f"- Oldest Entry: {processor_stats['date_range'][0][:10]}")
+                st.write(f"- Newest Entry: {processor_stats['date_range'][1][:10]}")
+                
+            st.write(f"- Estimated API Calls Saved: {processor_stats['estimated_api_calls_saved']}")
+    except Exception as e:
+        col2.error(f"Error retrieving processor cache stats: {str(e)}")
+    
+    # Cache management buttons
+    st.subheader("Cache Management")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("Clear Old Cache (30+ days)"):
+            components['lead_generator'].clear_cache(days_old=30)
+            components['processor'].clear_lead_cache(days_old=30)
+            st.success("Cleared cache entries older than 30 days")
+            
+    with col2:
+        if st.button("Clear All Search Cache"):
+            components['lead_generator'].clear_cache(days_old=0)
+            st.success("Cleared all search cache entries")
+            
+    with col3:
+        if st.button("Clear All Processed Lead Cache"):
+            components['processor'].clear_lead_cache(days_old=0)
+            st.success("Cleared all processed lead cache entries")
+    
+    # Add a new section specifically for geocode cache management
+    st.subheader("Geocode Cache Management")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("Clear All Geocode Cache"):
+            components['lead_generator'].clear_geocode_cache()
+            st.success("Cleared all geocode cache entries")
+            
+    with col2:
+        location_to_clear = st.text_input("Location to Clear from Cache", 
+                                          placeholder="e.g., Waltham, MA")
+        if st.button("Clear Specific Location Cache") and location_to_clear:
+            components['lead_generator'].clear_geocode_cache(location=location_to_clear)
+            st.success(f"Cleared cache for {location_to_clear}")
+
+
+def verify_cache(self) -> Dict:
+    """Verify cache integrity and return diagnostics"""
+    conn = sqlite3.connect(self.cache_db_path)
+    cursor = conn.cursor()
+    
+    # Check if tables exist
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [row[0] for row in cursor.fetchall()]
+    
+    # Check row counts
+    table_counts = {}
+    for table in tables:
+        cursor.execute(f"SELECT COUNT(*) FROM {table}")
+        table_counts[table] = cursor.fetchone()[0]
+    
+    # Check for corrupted entries
+    corrupted_entries = {}
+    
+    # Check search_cache for valid JSON
+    cursor.execute("SELECT cache_key, search_params, results FROM search_cache")
+    for row in cursor.fetchall():
+        cache_key, search_params, results = row
+        try:
+            json.loads(search_params)
+            json.loads(results)
+        except json.JSONDecodeError:
+            if 'search_cache' not in corrupted_entries:
+                corrupted_entries['search_cache'] = []
+            corrupted_entries['search_cache'].append(cache_key)
+    
+    # Check place_details_cache for valid JSON
+    cursor.execute("SELECT place_id, details FROM place_details_cache")
+    for row in cursor.fetchall():
+        place_id, details = row
+        try:
+            json.loads(details)
+        except json.JSONDecodeError:
+            if 'place_details_cache' not in corrupted_entries:
+                corrupted_entries['place_details_cache'] = []
+            corrupted_entries['place_details_cache'].append(place_id)
+    
+    conn.close()
+    
+    # Return diagnostics
+    return {
+        'tables_present': tables,
+        'table_counts': table_counts,
+        'corrupted_entries': corrupted_entries,
+        'cache_size_kb': os.path.getsize(self.cache_db_path) / 1024 if os.path.exists(self.cache_db_path) else 0,
+        'cache_health': 'good' if not corrupted_entries else 'corrupted'
+    }
